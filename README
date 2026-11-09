@@ -1,0 +1,243 @@
+Rennari Java
+============
+
+Java implementation of the Rennari protocol: a small, secure, MessagePack-
+or JSON-framed WebSocket event layer with custom events, rooms,
+namespaces, acknowledgements, and connection state recovery.
+
+Wire-compatible with Mojo::Rennari::Server (Perl), rennari-server-js
+(Node), rennari-go, rennari-py, rennari-rs, and rennari-client-js.
+
+Client and server live in one Maven artifact, as is idiomatic for Java.
+
+STATUS
+
+Working. Client and server tested against each other.
+
+INSTALL
+
+Add to your pom.xml:
+
+    <dependency>
+        <groupId>com.rennari</groupId>
+        <artifactId>rennari</artifactId>
+        <version>0.1.0</version>
+    </dependency>
+
+Or with Gradle:
+
+    implementation 'com.rennari:rennari:0.1.0'
+
+Requires Java 17 or newer.
+
+QUICK START
+
+Server:
+
+    import com.rennari.Server;
+    import java.net.InetSocketAddress;
+    import java.util.Map;
+
+    public class App {
+        public static void main(String[] args) throws Exception {
+            Server.Options opts = new Server.Options();
+            opts.mock = true;
+
+            Server server = new Server(opts);
+
+            server.on("chat", (ctx, p) -> {
+                Map<?, ?> m = (Map<?, ?>) p;
+                String room = (String) m.get("room");
+                ctx.join(room);
+                ctx.broadcastToRoom(room, "chat", p);
+                return null;
+            });
+
+            var ws = server.build(new InetSocketAddress("127.0.0.1", 3000));
+            ws.start();
+            Thread.currentThread().join();
+        }
+    }
+
+Client:
+
+    import com.rennari.Client;
+    import java.util.Map;
+
+    public class ClientApp {
+        public static void main(String[] args) throws Exception {
+            Client c = new Client(
+                "ws://127.0.0.1:3000/ws",
+                new Client.Options()
+            );
+
+            c.on("chat", p -> System.out.println("chat: " + p));
+            c.connect();
+            c.of("/").emit("chat", Map.of("room", "lobby", "text", "hi"));
+
+            Thread.sleep(500);
+            c.disconnect();
+        }
+    }
+
+CORE CONCEPTS
+
+Frames
+
+Every message is a map:
+
+    { e, d, id?, o?, n? }
+
+- e - event name, [A-Za-z0-9_.:-]{1,64}
+- d - payload
+- id - optional acknowledgement id
+- o - optional offset, present when recovery is enabled
+- n - optional namespace, omitted for /
+
+Serialized as MessagePack by default, or JSON if configured. Binary
+WebSocket frames, always.
+
+Classes
+
+- com.rennari.Frame      - the frame model
+- com.rennari.Protocol   - encode, decode, validation
+- com.rennari.Server     - server, options, context, handler
+- com.rennari.Client     - client, options, namespace
+
+Server: authentication
+
+AuthCb receives the ClientHandshake from Java-WebSocket. Return a
+non-null identity map to accept, null to reject with close code 1008.
+
+    opts.authCb = handshake -> {
+        String path = handshake.getResourceDescriptor();
+        String token = parseToken(path);
+        return tokens.get(token);
+    };
+
+Server: events
+
+    server.on("smile", (ctx, p) -> Map.of("ok", 1));
+
+If the handler returns a non-null value, it is sent back as
+{e: 'reply', d: value}.
+
+Handlers are synchronous. To do async work, spawn a thread and use the
+Context.
+
+Server: sends
+
+    ctx.sendToSelf("event", payload);
+    ctx.sendTo(id, "event", payload);
+    ctx.broadcast("event", payload);
+    ctx.broadcastToRoom("lobby", "chat", payload);
+
+Server: rooms
+
+    ctx.join("lobby");
+    ctx.leave("lobby");
+    ctx.membersOf("lobby");   // List<Long>
+    ctx.rooms();              // List<String>
+
+Rooms are per-namespace. Auto-create on first join, disappear when the
+last member leaves. No policy in the framework.
+
+Server: namespaces
+
+    server.namespace("/chat");
+    server.addHandler("/chat", "hello", (ctx, p) -> {
+        ctx.sendToSelf("hello_back", p);
+        return null;
+    });
+
+A client joins with {e: 'rennari_nsp', d: {name: '/chat'}}. The server
+replies rennari_nsp_ok. Frames for a namespace the client has not joined
+close the connection with code 4005.
+
+Server: acknowledgements
+
+Client sends id with an event. Server replies {e: 'rennari_ack',
+d: {id}} after the handler returns. No ack if the handler throws; the
+connection closes with 4004.
+
+Server: lifecycle hooks
+
+    server.onConnect((ctx, identity) -> { ... return null; });
+    server.onDisconnect((ctx, identity) -> { ... return null; });
+
+Server: recovery
+
+    Server.Options opts = new Server.Options();
+    opts.recovery = true;
+    opts.recoveryWindowSecs = 120;
+
+Off by default. When on, the server issues a session id at handshake,
+tracks an offset on every outbound frame, and buffers frames for a
+connection that has dropped. On reconnect, the client sends
+{e: 'rennari_resume', d: {session_id, offset}}. The server replays missed
+frames, re-attaches namespaces and rooms, and replies rennari_resumed.
+
+Server: mock mode
+
+    Server.Options opts = new Server.Options();
+    opts.mock = true;
+
+Skips auth, synthesizes an identity, ignores unknown events. Development
+only.
+
+CLOSE CODES
+
+- 4002 - bad frame
+- 4003 - unknown event
+- 4004 - handler error
+- 4005 - unknown namespace
+- 4006 - recovery disabled but client sent rennari_resume
+
+CLIENT
+
+    Client.Options opts = new Client.Options();
+    opts.serializer = Protocol.Serializer.MSGPACK;
+    opts.maxBytes = 64 * 1024;
+    opts.ackTimeoutMs = 5000;
+    opts.retries = 3;
+    opts.extraHeaders = Map.of("Origin", "https://example.com");
+
+    Client c = new Client(url, opts);
+    c.on("event", handler);
+    c.of("/chat").on("message", handler);
+    c.connect();
+    c.of("/").emit("event", payload);
+    c.of("/chat").emit("message", payload);
+    c.of("/").emitWithAck("ping", payload);
+    c.disconnect();
+    c.sessionId();      // String, null if not set
+    c.lastOffset();     // long, -1 if not set
+
+The client declares all non-default namespaces it has registered
+immediately after connecting.
+
+SECURITY
+
+- authCb runs before the connection is accepted. A null return closes
+  with 1008.
+- Frames are validated on decode: event name grammar, id format, offset
+  format, namespace grammar, size limit.
+- Decoder throws, never returns garbage.
+- Serializer is fixed per server or client.
+- Mock mode is development-only; there is no production refusal guard
+  like the JS and Perl servers have. Do not set mock in production.
+
+The framework does not implement rate limiting. Add per-connection
+budgets at the application level or use a reverse proxy.
+
+EXAMPLES
+
+examples/App.java runs a standalone server. examples/ClientApp.java runs
+a client against it.
+
+    mvn exec:java -Dexec.mainClass=com.rennari.examples.App
+    mvn exec:java -Dexec.mainClass=com.rennari.examples.ClientApp
+
+LICENSE
+
+MIT.
