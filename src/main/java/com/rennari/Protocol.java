@@ -5,6 +5,7 @@ import org.msgpack.core.MessageBufferPacker;
 import org.msgpack.core.MessagePack;
 import org.msgpack.core.MessageUnpacker;
 import org.msgpack.value.Value;
+import org.msgpack.value.ValueType;
 
 import java.io.IOException;
 import java.util.Map;
@@ -163,20 +164,30 @@ public final class Protocol {
     }
 
     private static Object toJava(Value v) {
-        if (v.isNil()) return null;
-        if (v.isString()) return v.asStringValue().asString();
-        if (v.isInteger()) return v.asIntegerValue().toLong();
-        if (v.isBoolean()) return v.asBooleanValue().getBoolean();
-        if (v.isMap()) {
-            Map<String, Object> m = new java.util.LinkedHashMap<>();
-            v.asMapValue().map().forEach((k, val) -> m.put(k.asStringValue().asString(), toJava(val)));
-            return m;
+        switch (v.getValueType()) {
+            case NIL:
+                return null;
+            case STRING:
+                return v.asStringValue().asString();
+            case INTEGER:
+                return v.asIntegerValue().toLong();
+            case BOOLEAN:
+                return v.asBooleanValue().getBoolean();
+            case FLOAT:
+                return v.asFloatValue().toDouble();
+            case MAP: {
+                Map<String, Object> m = new java.util.LinkedHashMap<>();
+                v.asMapValue().map().forEach((k, val) ->
+                    m.put(k.asStringValue().asString(), toJava(val)));
+                return m;
+            }
+            case ARRAY: {
+                java.util.List<Object> list = new java.util.ArrayList<>();
+                v.asArrayValue().forEach(val -> list.add(toJava(val)));
+                return list;
+            }
+            default:
+                return v.toString();
         }
-        if (v.isArray()) {
-            java.util.List<Object> list = new java.util.ArrayList<>();
-            v.asArrayValue().forEach(val -> list.add(toJava(val)));
-            return list;
-        }
-        return v.toString();
     }
 }
